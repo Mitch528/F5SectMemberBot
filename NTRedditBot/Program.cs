@@ -55,13 +55,18 @@ namespace NTRedditBot
             _configuration = config;
 
             var cts = new CancellationTokenSource();
-            var runner = new Thread(() => RunAsync(_configuration, cts.Token).GetAwaiter().GetResult());
-            runner.IsBackground = true;
+
+            var runner = new Thread(() => RunAsync(_configuration, cts.Token).GetAwaiter().GetResult())
+            {
+                IsBackground = true
+            };
 
             runner.Start();
 
             Console.WriteLine("Running...");
             Console.ReadLine();
+
+            Console.WriteLine("Stopping...");
 
             cts.Cancel();
             runner.Join();
@@ -76,54 +81,80 @@ namespace NTRedditBot
 
             var ntSubreddit = await api.GetSubredditAsync(reddit["Subreddit"], token);
 
-            var comments = await ntSubreddit.GetCommentsAsync(new GetCommentsRequest
+            var commentReq = new GetCommentsRequest
             {
-                Limit = 25,
+                Limit = 100,
                 Sort = CommentSort.New
-            }, token);
+            };
 
-            await ProcessComments(ntSubreddit, comments.OfType<Comment>().ToArray());
-
-            var stream = comments.GetStream()
-                .Catch(Observable.Empty<Comment>())
-                .OfType<Comment>()
-                .TakeUntil(Observable.Create<Unit>(observer => token.Register(() => observer.OnNext(Unit.Default))))
-                .ToEnumerable();
-
-            foreach (Comment comment in stream)
+            DateTime last = DateTime.UtcNow;
+            while (true)
             {
-                Log.Debug("Processing new comment");
+                if (token.IsCancellationRequested)
+                    break;
 
                 try
                 {
-                    await ProcessComments(ntSubreddit, comment);
+                    var comments = await ntSubreddit.GetCommentsAsync(commentReq, token);
+                    commentReq.Before = comments.FirstOrDefault()?.FullName ?? commentReq.Before;
+
+                    if (!string.IsNullOrEmpty(commentReq.Before))
+                    {
+                        var listing = await ntSubreddit.GetInfoAsync(new InfoRequest { Ids = commentReq.Before }, token);
+
+                        var beforeComment = listing.OfType<Comment>().FirstOrDefault();
+
+                        if (beforeComment == null || beforeComment.Author == "[deleted]")
+                        {
+                            Log.Warning("The 'before' comment has been deleted, resetting...");
+
+                            commentReq.Before = null;
+
+                            continue;
+                        }
+                    }
+
+                    if (comments.Any())
+                    {
+                        last = DateTime.UtcNow;
+
+                        Log.Debug("Processing new comments...");
+                    }
+                    else if (DateTime.UtcNow - last > TimeSpan.FromMinutes(15))
+                    {
+                        Log.Warning("No comments found in the last {Last} minutes (last before fullname: {FullName})", (int)(DateTime.UtcNow - last).TotalMinutes, commentReq.Before);
+
+                        commentReq.Before = null;
+                    }
+
+                    foreach (Comment comment in comments.OfType<Comment>())
+                    {
+                        try
+                        {
+                            await ProcessComments(ntSubreddit, comment);
+                        }
+                        catch (Exception ex)
+                        {
+                            Log.Error(ex, "An error has occurred while processing a comment");
+                        }
+                    }
                 }
                 catch (Exception ex)
                 {
-                    Log.Error(ex, "An error has occurred while processing a comment");
+                    Log.Error(ex, "An error has occurred while trying to retrieve comments");
+                }
+
+                try
+                {
+                    await Task.Delay(TimeSpan.FromSeconds(15), token);
+                }
+                catch (TaskCanceledException)
+                {
+                    break;
                 }
             }
 
-            //IDisposable stream = comments.GetStream()
-            //    .OfType<Comment>()
-            //    .Select(comment => Observable.FromAsync(async _ =>
-            //    {
-            //        await ProcessComments(comment);
-            //    }))
-            //    .Concat()
-            //    .Subscribe();
-
-            //try
-            //{
-            //    await Task.Delay(-1, token);
-            //}
-            //catch (TaskCanceledException)
-            //{
-            //}
-            //finally
-            //{
-            //    stream.Dispose();
-            //}
+            Log.Information("Cancelled.");
         }
 
         private static async Task ProcessComments(Subreddit subreddit, params Comment[] comments)
@@ -135,28 +166,28 @@ namespace NTRedditBot
 
             foreach (Comment comment in comments)
             {
-                var link = await subreddit.Api.GetLinksById(new ListingRequest(), new[] { comment.LinkId });
-
-                if (!link.Any() || comment.Author == selfUser)
+                var listing = await subreddit.GetCommentAndRepliesAsync(new GetCommentRepliesRequest
                 {
-                    continue;
-                }
-
-                var replies = await link.OfType<Link>().First().GetCommentsAsync(new GetCommentsRequest
-                {
-                    Comment = comment.Id,
-                    Sort = CommentSort.New
+                    CommentId = comment.Id,
+                    LinkId = comment.LinkId
                 });
 
-                if (replies.OfType<Comment>().Any(p => p.Author == selfUser))
+                var commentWithReplies = listing.OfType<Comment>().FirstOrDefault();
+
+                if (commentWithReplies?.Replies.OfType<Comment>().Any(p => p.Author == selfUser) ?? false)
                 {
                     Log.Warning("Already replied to comment by {Author}, skipping...", comment.Author);
 
                     continue;
                 }
 
-                var commentMatches = commentRegex.Matches(comment.Body);
+                var commentMatches = commentRegex.Matches(comment.Body).Cast<Match>().ToList();
                 var novels = new List<Novel>();
+
+                if (commentMatches.Any())
+                {
+                    Log.Information("Processing comment by {Commenter} in {Link}...", comment.Author, comment.LinkTitle);
+                }
 
                 foreach (Match commentMatch in commentMatches)
                 {
@@ -210,9 +241,6 @@ namespace NTRedditBot
                 sb.AppendLine($"Description: {desc}");
                 sb.AppendLine();
                 sb.AppendLine($"{novel.Type} | Genres: {genres} | Tags: {tags}");
-                sb.AppendLine();
-                sb.AppendLine("---");
-                sb.AppendLine("^[Source](https://github.com/Mitch528/F5SectMemberBot)");
 
                 if (ctr < novels.Count - 1)
                 {
@@ -221,6 +249,10 @@ namespace NTRedditBot
 
                 ctr++;
             }
+
+            sb.AppendLine();
+            sb.AppendLine("---");
+            sb.AppendLine("^[Source](https://github.com/Mitch528/F5SectMemberBot)");
 
             string body = sb.ToString();
 
